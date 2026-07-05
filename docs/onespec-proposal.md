@@ -16,9 +16,11 @@ lack.
 |---|---|---|
 | **Execution model** | Artifact-guided (OpenSpec-style). OneSpec emits artifacts + slash commands; it does **not** drive the AI itself. "Automatic after Propose" = a chained sequence of slash-command handoffs the host assistant runs. | No orchestration engine to build/maintain. Matches the tool we're reusing. |
 | **Host assistant** | **GitHub Copilot CLI first-class** (generate Copilot-native agents/prompts). Agent contract kept host-agnostic so Claude Code / Cursor are a v2 add. | Team's tool; phases map to Copilot agent types. |
-| **Language / packaging** | **TypeScript + Node, npm/npx** (`npx onespec init`). | Matches OpenSpec exactly → maximum convention reuse, lowest-friction init. |
-| **Methodology default** | `tdd` (recommended). | Universal; BDD is the spec-native alternative. See §7. |
-| **Spec location** | In-repo under `onespec/`, committed with code. | Version-controlled, brownfield-friendly. Shared/remote store = v2. |
+| **Language / packaging** | **TypeScript + Node, npm/npx** — `npx onespec init` per-repo (**locked**). | Matches OpenSpec exactly → maximum convention reuse, lowest-friction init. |
+| **Methodology default** | **`tdd` (locked)**. Menu: `tdd` (default), `bdd`, `contract-first`, `test-after`, `lean`. | Universal; BDD is the spec-native alternative. |
+| **Spec location** | **In-repo** under `onespec/`, committed with code (**locked**). | Version-controlled, brownfield-friendly. Shared/remote store = v2. |
+| **Phase cadence** | **Hybrid (locked)**. Code-Review + Security-Review = `per-change` (in the auto handoff chain, scoped to the change diff). Threat-Model + Supply-Chain = `per-milestone` (standalone commands). | Per-change gates guard every diff; STRIDE + supply-chain model the whole current repo, so they run at the developer's own boundary. |
+| **Milestone model** | **Trigger, not an entity (locked)**. No milestone folder/object. Milestone commands regenerate repo-level *living docs* in place: `onespec/security/threat-model.md`, `onespec/security/supply-chain-audit.md`. Manual by default; opt-in CI hook on `git tag`/release. | STRIDE/supply-chain operate on the repo's present snapshot — nothing to diff or author, so no change-range. |
 
 ---
 
@@ -92,6 +94,10 @@ flowchart TB
 
 ### State machine (phases + gates)
 
+Two independent chains: a **per-change** chain (runs on every change) and a
+**per-milestone** pair (run on demand at the developer's own boundary).
+
+**Per-change chain**
 ```mermaid
 stateDiagram-v2
   direction LR
@@ -101,10 +107,18 @@ stateDiagram-v2
   Propose --> Implement: APPROVE gate
   Implement --> CodeReview: handoff (prompt: switch model)
   CodeReview --> SecurityReview: handoff
-  SecurityReview --> ThreatModel: handoff (STRIDE)
-  ThreatModel --> SupplyChain: handoff
-  SupplyChain --> Archive: handoff
+  SecurityReview --> Archive: handoff
   Archive --> [*]: specs reconciled
+```
+
+**Per-milestone pair** — standalone commands, no change-range; regenerate
+repo-level living docs in place:
+```mermaid
+flowchart LR
+  trig["Milestone boundary<br/>(release / sprint end / git tag)"] --> tm["/onespec-threat-model<br/>(STRIDE)"]
+  trig --> sc["/onespec-supply-chain"]
+  tm --> tmdoc["onespec/security/threat-model.md"]
+  sc --> scdoc["onespec/security/supply-chain-audit.md"]
 ```
 
 - **Manual gate at Propose** is the only hard human stop (borrowed from SpecKit's
@@ -116,6 +130,15 @@ stateDiagram-v2
 - **No state-machine file.** Phase completion is *inferred from artifact
   existence* (OpenSpec pattern): `onespec status` checks which artifacts a change
   has vs the schema graph and reports `done / ready / blocked`.
+- **Per-change vs per-milestone.** Code-Review + Security-Review join every
+  change's auto chain (`per-change`, scoped to that change's diff). Threat-Model
+  (STRIDE) + Supply-Chain-Audit are `per-milestone` standalone commands — a
+  milestone is a *trigger* (release, sprint end), not an artifact. They regenerate
+  the repo-level living docs `onespec/security/*.md` in place, version-controlled.
+  Default trigger is manual; teams opt into automation by hooking the commands
+  into CI on `git tag`/release.
+  <!-- ponytail: no scheduler or trigger enum in v1; add a milestone-history
+       artifact only if teams later need to track past threat models over time. -->
 
 ### Components
 | Component | Reuse source | Role |
@@ -153,15 +176,20 @@ rules:                       # per-artifact constraints -> <rules> for that arti
 
 # Phase -> first-party agent bindings, drawn from the built-in roster.
 phases:
-  ideation:        { gate: manual,  agent: onespec-explorer }
-  propose:         { gate: manual,  agent: onespec-proposer }
-  implement:       { gate: agentic, agent: onespec-implementer }
-  code-review:     { gate: agentic, agent: onespec-code-reviewer, model_switch: true }
-  security-review: { gate: agentic, agent: onespec-security-reviewer }
-  threat-model:    { gate: agentic, agent: onespec-threat-modeler }   # STRIDE
-  supply-chain:    { gate: agentic, agent: onespec-supply-chain-auditor }
-  archive:         { gate: agentic, agent: onespec-spec-reconciler }
+  ideation:        { gate: manual,  cadence: per-change,    agent: onespec-explorer }
+  propose:         { gate: manual,  cadence: per-change,    agent: onespec-proposer }
+  implement:       { gate: agentic, cadence: per-change,    agent: onespec-implementer }
+  code-review:     { gate: agentic, cadence: per-change,    agent: onespec-code-reviewer, model_switch: true }
+  security-review: { gate: agentic, cadence: per-change,    agent: onespec-security-reviewer }
+  threat-model:    { gate: agentic, cadence: per-milestone, agent: onespec-threat-modeler }        # STRIDE, standalone /onespec-threat-model
+  supply-chain:    { gate: agentic, cadence: per-milestone, agent: onespec-supply-chain-auditor }  # standalone /onespec-supply-chain
+  archive:         { gate: agentic, cadence: per-change,    agent: onespec-spec-reconciler }
 ```
+
+`cadence` places a phase in the per-change auto chain (`per-change`) or exposes it
+as a standalone milestone command (`per-milestone`). Per-milestone phases write
+repo-level living docs under `onespec/security/*.md` (regenerated in place), not a
+change folder.
 
 `config.yaml` **wins** over the constitution on any conflict. The constitution is
 prose that shapes agent behavior and is checked at a **Constitution Check** gate
@@ -184,7 +212,7 @@ model_hint: null                 # optional; code-reviewer sets this to prompt a
 commands:                        # slash commands this agent contributes
   - id: security-review
     summary: Review produced code for vulnerabilities
-    handoff: threat-model        # next phase in the chain
+    handoff: archive             # next phase in the per-change chain
 instruction: ./instruction.md    # the prompt body (host-agnostic markdown)
 ```
 
@@ -195,6 +223,10 @@ instruction: ./instruction.md    # the prompt body (host-agnostic markdown)
   same manifest).
 - **Handoff chain** (`commands[].handoff`) is what makes post-Propose phases run
   automatically without an orchestrator.
+- **Per-milestone agents** (`threat-modeler`, `supply-chain-auditor`) carry no
+  `handoff` — they're standalone commands. Their `produces` are repo-level living
+  docs (`onespec/security/threat-model.md`, `onespec/security/supply-chain-audit.md`),
+  regenerated in place, not change-folder artifacts.
 - **v1 roster**: `explorer`, `proposer`, `implementer` (ponytail), `code-reviewer`
   (model-switch), `security-reviewer`, `threat-modeler` (STRIDE),
   `supply-chain-auditor`, `spec-reconciler`.
@@ -247,9 +279,11 @@ consistency so a change to one spec can't silently break another.
 - Copilot integration shape: `.github/prompts/*.prompt.md` + `.github/copilot-instructions.md`.
 
 ### Change / add (the differentiator)
-- New first-class phases + agents: Code-Review, Security-Review, Threat-Model
-  (STRIDE), Supply-Chain-Audit — none exist in either tool.
-- Extend the schema graph to sequence these after Implement via handoffs.
+- New first-class phases + agents: Code-Review, Security-Review (per-change, in the
+  auto chain), Threat-Model (STRIDE) + Supply-Chain-Audit (per-milestone, standalone
+  commands writing `onespec/security/*.md`) — none exist in either tool.
+- Wire Code-Review + Security-Review into the per-change handoff chain after
+  Implement; expose Threat-Model + Supply-Chain as milestone commands.
 - Harden spec propagation with cross-spec drift blocking (stronger than OpenSpec).
 - Bake ponytail into the implementer contract.
 
@@ -264,20 +298,13 @@ consistency so a change to one spec can't silently break another.
 
 ---
 
-## 7. Open decisions (recommendations)
+## 7. Open questions
 
-- **Methodology default → `tdd`.** Menu: `tdd` (test-first, default), `bdd`
-  (scenario-first — maps cleanest to Given/When/Then specs; strong alt),
-  `contract-first` (schema/types as contract), `test-after`, `lean` (tests on
-  critical paths only, ponytail-native). Methodology tunes the `tasks` rules +
-  implementer instructions.
-- **Specs location → in-repo** under `onespec/`, committed with code. Shared/remote
-  store deferred to v2.
-- **Distribution → `npx onespec init` per repo** + optional global install.
-- Still worth confirming before build: (a) exact Copilot CLI artifact paths
-  (`.github/agents` vs `.github/prompts` vs skills) against the team's Copilot
-  setup; (b) whether Threat-Model + Supply-Chain run per-change or once per repo
-  milestone.
+All prior recommendations are now **locked in §0** (methodology = TDD, specs in-repo,
+`npx onespec init` distribution, hybrid cadence, milestone model). One open item remains:
+
+- **Copilot CLI artifact paths** — `.github/agents` vs `.github/prompts` vs skills
+  (or a mix). To be verified against real GitHub Copilot CLI conventions at build time.
 
 ---
 
@@ -290,9 +317,12 @@ consistency so a change to one spec can't silently break another.
 3. **Agent registry + manual phases + Implement** — agent manifest contract;
    `explorer` (Ideation), `proposer` (Propose + approval gate), `implementer`
    (ponytail baked in).
-4. **Differentiator phases** — `code-reviewer` (model-switch prompt),
-   `security-reviewer`, `threat-modeler` (STRIDE), `supply-chain-auditor`;
-   artifacts + handoff sequence.
+4. **Differentiator phases** — *per-change chain*: wire `code-reviewer`
+   (model-switch prompt) + `security-reviewer` into the auto handoff chain after
+   Implement (Implement → Code-Review → Security-Review → Archive), scoped to the
+   change diff. *Per-milestone*: standalone `/onespec-threat-model` (STRIDE) +
+   `/onespec-supply-chain` commands writing repo-level `onespec/security/*.md`
+   living docs (manual default; opt-in CI hook on `git tag`).
 5. **Spec propagation + no-drift** — delta merge on archive; `/analyze`-style
    reconciliation blocking; `onespec validate`.
 6. **Constitution gate** — Constitution Check inside Propose; Sync Impact Report propagation.
